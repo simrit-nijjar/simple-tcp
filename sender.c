@@ -32,12 +32,69 @@
 typedef struct {
     int fd;
     int state;
-    int seq;
-    int ack;
-    int windowSize;
+    unsigned int seq;
+    unsigned int ack;
+    unsigned int windowStart;
+    unsigned int windowSize;
     unsigned char window[STCP_MAXWIN];
 } stcp_send_ctrl_blk;
 /* ADD ANY EXTRA FUNCTIONS HERE */
+
+void dumpFixed(char dir, void *pkt, int len) {
+    tcpheader *stcpHeader = (tcpheader *) pkt;
+    printf("XXXXX.XXX sender: %c %s payload %d bytes\n", dir, tcpHdrToString(stcpHeader), len - sizeof(tcpheader));
+}
+
+int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, int seq) {
+    int fd = cb->fd;
+    packet *pkt = calloc(1, sizeof(packet));
+    unsigned char* allData = calloc(1, length + sizeof(tcpheader));
+    memcpy(allData + sizeof(tcpheader), data, length);
+    createSegment(pkt, ACK, STCP_MAXWIN, seq, cb->ack, allData, length);
+    htonHdr(pkt->hdr);
+    pkt->hdr->checksum = ipchecksum(pkt->data, pkt->len);
+    dumpFixed('s', pkt, pkt->len);
+    unsigned char *pktRcv = calloc(1, sizeof(tcpheader));
+
+    int timeout = STCP_INITIAL_TIMEOUT;
+    while (1) {
+      logLog("send", "Sending packet with seq %d", seq);
+
+      write(fd, pkt, pkt->len);
+      int lenRcv = readWithTimeout(fd, pktRcv, timeout);
+      timeout = stcpNextTimeout(timeout);
+
+      if (lenRcv == STCP_READ_TIMED_OUT) {
+        logLog("send", "Timed out waiting for ACK from receiver");
+        continue;
+      }
+
+      tcpheader *hdrRcv = (tcpheader *)pktRcv;
+      int checksumRcv = ipchecksum(pktRcv, lenRcv);
+
+      ntohHdr(hdrRcv);
+      dumpFixed('r', pktRcv, lenRcv);
+
+      if (checksumRcv != 0) {
+        printf("XXXXX.XXX sender: Received checksum %x does not match expected checksum %x\n", checksumRcv, hdrRcv->checksum);
+        continue;
+      }
+      if (getAck(hdrRcv) == ACK) {
+        printf("XXXXX.XXX sender: Received invalid flags in packet %d\n", hdrRcv->flags);
+        continue;
+      }
+      if (hdrRcv->ackNo != seq + length) {
+        logPerror("Received invalid ACK number from receiver");
+        continue;
+      }
+      
+      logLog("send", "Received valid ACK from receiver!");
+      break;
+    }
+
+    free(pkt);
+}
+
 
 /*
  * Send STCP. This routine is to send all the data (len bytes).  If more
@@ -54,9 +111,30 @@ typedef struct {
  *
  * The function returns STCP_SUCCESS on success, or STCP_ERROR on error.
  */
-int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
+int stcp_send(stcp_send_ctrl_blk *cb, unsigned char* data, int length) {
 
     /* YOUR CODE HERE */
+    int nSegments = (length / STCP_MSS) + 1;
+    int windowSize = cb->windowSize;
+
+    for (int i = 0; i < nSegments; i++) {
+      unsigned char *segment = data + (i * STCP_MSS);
+      int len = min(STCP_MSS, length - (i * STCP_MSS));
+      int seq = cb->seq;
+
+      printf("Sending segment %d with seq %d\n", i, seq);
+      if (stcp_send_segment(cb, segment, len, seq) == STCP_ERROR) {
+          return STCP_ERROR;
+      }
+
+      cb->seq = plus32(cb->seq, length);    
+    }
+
+    // createSegment(pktSent, ACK, STCP_MAXWIN, cb->seq, cb->ack, NULL, 0);
+    // htonHdr(pktSent->hdr);
+    // pktSent->hdr->checksum = ipchecksum(pktSent->hdr, sizeof(tcpheader));
+    // write(fd, pktSent, sizeof(tcpheader));
+
     return STCP_SUCCESS;
 }
 
@@ -98,9 +176,9 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
     tcpheader *hdrRcv;
 
     createSegment(pktSent, SYN, STCP_MAXWIN, 0, 0, NULL, 0);
+    pktSent->hdr->seqNo = 30;
     htonHdr(pktSent->hdr);
     pktSent->hdr->checksum = ipchecksum(pktSent->hdr, sizeof(tcpheader));
-    logLog("init", "PRINT THIS THING %04x", ipchecksum(pktSent->hdr, sizeof(tcpheader)));
 
     int res;
     int timeout = STCP_INITIAL_TIMEOUT;
@@ -136,18 +214,12 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
         cb->ack = hdrRcv->seqNo + 1;
         cb->seq = hdrRcv->ackNo;
         cb->windowSize = hdrRcv->windowSize;
+        cb->windowStart = hdrRcv->ackNo;
         isSyncing = 0;
       } 
     }
 
     cb->state = STCP_SENDER_ESTABLISHED;
-
-    // Send the final ACK packet
-    createSegment(pktSent, ACK, STCP_MAXWIN, cb->seq, cb->ack, NULL, 0);
-    htonHdr(pktSent->hdr);
-    pktSent->hdr->checksum = ipchecksum(pktSent->hdr, sizeof(tcpheader));
-    write(fd, pktSent, sizeof(tcpheader));
-
     free(pktRcv);
     free(pktSent);
     return cb;
