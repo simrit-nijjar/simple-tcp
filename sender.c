@@ -30,12 +30,12 @@
 #define STCP_ERROR -1
 
 typedef struct {
-
-
-    int DELETE_ME;     /* used only to make this compile */
-
-    /* YOUR CODE HERE */
-
+    int fd;
+    int state;
+    int seq;
+    int ack;
+    int windowSize;
+    unsigned char window[STCP_MAXWIN];
 } stcp_send_ctrl_blk;
 /* ADD ANY EXTRA FUNCTIONS HERE */
 
@@ -60,8 +60,6 @@ int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
     return STCP_SUCCESS;
 }
 
-
-
 /*
  * Open the sender side of the STCP connection. Returns the pointer to
  * a newly allocated control block containing the basic information
@@ -77,15 +75,82 @@ int stcp_send(stcp_send_ctrl_blk *stcp_CB, unsigned char* data, int length) {
  * very good for a pure request response protocol like DNS where there
  * is no long term relationship between the client and server.
  */
-stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort,
-                             int receiversPort) {
+stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receiversPort) {
 
     logLog("init", "Sending from port %d to <%s, %d>", sendersPort, destination, receiversPort);
     // Since I am the sender, the destination and receiversPort name the other side
     int fd = udp_open(destination, receiversPort, sendersPort);
     (void) fd;
     /* YOUR CODE HERE */
-    return NULL;
+    stcp_send_ctrl_blk *cb = malloc(sizeof(stcp_send_ctrl_blk));
+    if (fd < 0) {
+        logPerror("Failed to open connection");
+        return NULL;
+    }
+    cb->fd = fd;
+    cb->windowSize = STCP_MAXWIN;
+
+    logLog("init", "Sending initial SYN pack to receiver");
+
+    // init sent packet
+    packet *pktSent = calloc(1, sizeof(packet));
+    unsigned char *pktRcv = calloc(1, sizeof(tcpheader));
+    tcpheader *hdrRcv;
+
+    createSegment(pktSent, SYN, STCP_MAXWIN, 0, 0, NULL, 0);
+    htonHdr(pktSent->hdr);
+    pktSent->hdr->checksum = ipchecksum(pktSent->hdr, sizeof(tcpheader));
+    logLog("init", "PRINT THIS THING %04x", ipchecksum(pktSent->hdr, sizeof(tcpheader)));
+
+    int res;
+    int timeout = STCP_INITIAL_TIMEOUT;
+    int isSyncing = 1;
+
+    // Try to send the initial SYN packet
+    while (isSyncing) {
+      // Send the SYN packet
+      write(fd, pktSent, sizeof(tcpheader));
+      cb->state = STCP_SENDER_SYN_SENT;
+
+
+      // Wait for the SYN-ACK packet
+      res = readWithTimeout(fd, pktRcv, timeout);
+      timeout = stcpNextTimeout(timeout);
+
+      // The receiver socket has closed
+      if (res == STCP_READ_TIMED_OUT) {
+        logLog("init", "Timed out waiting for SYN-ACK from receiver");
+        continue;
+      } else
+      if (res == STCP_READ_PERMANENT_FAILURE) {
+        logPerror("Failed to read SYN-ACK from receiver");
+        return NULL;
+      }
+
+      // The receiver has replied with a packet
+      hdrRcv = (tcpheader *)pktRcv;
+      ntohHdr(hdrRcv);
+      if (hdrRcv->flags == (SYN | ACK)) {
+        logLog("init", "Received SYN-ACK from receiver");
+        cb->state = STCP_SENDER_ESTABLISHED;
+        cb->ack = hdrRcv->seqNo + 1;
+        cb->seq = hdrRcv->ackNo;
+        cb->windowSize = hdrRcv->windowSize;
+        isSyncing = 0;
+      } 
+    }
+
+    cb->state = STCP_SENDER_ESTABLISHED;
+
+    // Send the final ACK packet
+    createSegment(pktSent, ACK, STCP_MAXWIN, cb->seq, cb->ack, NULL, 0);
+    htonHdr(pktSent->hdr);
+    pktSent->hdr->checksum = ipchecksum(pktSent->hdr, sizeof(tcpheader));
+    write(fd, pktSent, sizeof(tcpheader));
+
+    free(pktRcv);
+    free(pktSent);
+    return cb;
 }
 
 
@@ -164,6 +229,7 @@ int main(int argc, char **argv) {
     cb = stcp_open(destinationHost, sendersPort, receiversPort);
     if (cb == NULL) {
         /* YOUR CODE HERE */
+        logPerror("Failed to open connection");
     }
 
     /* Start to send data in file via STCP to remote receiver. Chop up
