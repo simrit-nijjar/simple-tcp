@@ -1,6 +1,14 @@
 # simple-tcp
 CPSC 317 - Programming Assignment 04
 
+## Overview
+
+The purpose of this assignment is to give you an opportunity to build a simplified version of a transport service that provides a reliable streamed delivery service similar to TCP. You will use this service to transfer a file from a sender to a receiver.
+
+This protocol, named STCP (Simplified Transport Control Protocol) will support a window based flow-control mechanism, but it will not have congestion control. In addition, unlike TCP, data will only flow from the sender to the receiver (ACKs will flow in the reverse direction). In broad terms the protocol has a setup phase, a data transfer phase, and a shutdown phase. In this assignment you will only have to write the sender side, the receiver has already been written for you.
+
+We believe that the receiver is reasonably robust but it may contain bugs, so don't be surprised if it occasionally crashes if your application isn't working properly.
+
 ## SCTP Specification
 
 
