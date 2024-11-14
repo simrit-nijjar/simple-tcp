@@ -40,60 +40,109 @@ typedef struct {
 } stcp_send_ctrl_blk;
 /* ADD ANY EXTRA FUNCTIONS HERE */
 
-void dumpFixed(char dir, void *pkt, int len) {
-    tcpheader *stcpHeader = (tcpheader *) pkt;
-    printf("XXXXX.XXX sender: %c %s payload %d bytes\n", dir, tcpHdrToString(stcpHeader), len - sizeof(tcpheader));
+
+/**
+ * Validate the checksum of a packet
+ * 
+ * @param pkt The packet to calculate checksum for in host byte order
+ * 
+ * @return The calculated checksum, or -1 if the checksum is invalid
+ */
+int validateChecksum(packet *pkt) {
+    tcpheader *hdr = (tcpheader *) pkt->hdr;
+    unsigned short checksum = ipchecksum(pkt->data, pkt->len);
+    if (checksum != 0) return checksum;
+    return 1;
+}
+
+/**
+ * Create a new segment from received data and set header to host byte order
+ * 
+ * @param data The tcp packet to parse
+ * @param len The length of the tcp packet
+ * 
+ * @return The parsed packet in host byte order
+ */
+void parsePacket(packet* pkt, unsigned char *data, int len) {
+    pkt->len = len;
+    if (data != NULL) {
+        memcpy(pkt->data, data, len);
+    }
+    pkt->hdr = (tcpheader *) pkt->data; 
+    ntohHdr(pkt->hdr);
 }
 
 int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, int seq) {
     int fd = cb->fd;
+
+    // Allocate and copy data
     packet *pkt = calloc(1, sizeof(packet));
-    unsigned char* allData = calloc(1, length + sizeof(tcpheader));
-    memcpy(allData + sizeof(tcpheader), data, length);
-    createSegment(pkt, ACK, STCP_MAXWIN, seq, cb->ack, allData, length);
-    htonHdr(pkt->hdr);
+    packet *pktRcv = calloc(1, sizeof(packet));
+
+    // Prepare the segment and set all necessary fields
+    createSegment(pkt, ACK, STCP_MAXWIN, seq, cb->ack, data, length);
+
+    // Calculate checksum on header + payload in host byte order
     pkt->hdr->checksum = ipchecksum(pkt->data, pkt->len);
-    dumpFixed('s', pkt, pkt->len);
-    unsigned char *pktRcv = calloc(1, sizeof(tcpheader));
 
+    // Display packet details for debugging
+    dump('s', pkt, pkt->len);
+
+    // Convert header fields to network byte order afterward
+    htonHdr(pkt->hdr);
+
+    // Setup buffer to receive incoming packet
+    unsigned char *buffer = calloc(1, sizeof(tcpheader));
     int timeout = STCP_INITIAL_TIMEOUT;
+
+    // Loop to send and wait for ACK
     while (1) {
-      logLog("send", "Sending packet with seq %d", seq);
+        logLog("send", "Sending packet with seq %d", seq);
 
-      write(fd, pkt, pkt->len);
-      int lenRcv = readWithTimeout(fd, pktRcv, timeout);
-      timeout = stcpNextTimeout(timeout);
+        // Send the packet and await response
+        write(fd, pkt, pkt->len);
+        int lenRcv = readWithTimeout(fd, buffer, timeout);
+        timeout = stcpNextTimeout(timeout);
 
-      if (lenRcv == STCP_READ_TIMED_OUT) {
-        logLog("send", "Timed out waiting for ACK from receiver");
-        continue;
-      }
+        if (lenRcv == STCP_READ_TIMED_OUT) {
+            logLog("send", "Timed out waiting for ACK from receiver");
+            continue;
+        }
 
-      tcpheader *hdrRcv = (tcpheader *)pktRcv;
-      int checksumRcv = ipchecksum(pktRcv, lenRcv);
+        // Process received packet
+        parsePacket(pktRcv, buffer, lenRcv);
+        tcpheader* hdrRcv = pktRcv->hdr;
 
-      ntohHdr(hdrRcv);
-      dumpFixed('r', pktRcv, lenRcv);
+        dump('r', pktRcv, lenRcv);
 
-      if (checksumRcv != 0) {
-        printf("XXXXX.XXX sender: Received checksum %x does not match expected checksum %x\n", checksumRcv, hdrRcv->checksum);
-        continue;
-      }
-      if (getAck(hdrRcv) == ACK) {
-        printf("XXXXX.XXX sender: Received invalid flags in packet %d\n", hdrRcv->flags);
-        continue;
-      }
-      if (hdrRcv->ackNo != seq + length) {
-        logPerror("Received invalid ACK number from receiver");
-        continue;
-      }
-      
-      logLog("send", "Received valid ACK from receiver!");
-      break;
+        // Verify checksum
+        int checkSum = validateChecksum(pktRcv);
+        if (!checkSum) {
+            logLog("failure", "Invalid Checksum -> Received %x but expected %x", checkSum, hdrRcv->checksum);
+            continue;
+        }
+
+        // Additional ACK checks
+        if (getAck(hdrRcv) != ACK) {
+            logLog("failure", "Invalid flags -> Received %x but expected %x", hdrRcv->flags, ACK);
+            continue;
+        }
+        if (hdrRcv->ackNo != seq + length) {
+            logLog("failure", "Invalid Ack -> Received %d but expected %d", hdrRcv->ackNo, seq + length);
+            continue;
+        }
+
+        logLog("send", "Received valid ACK from receiver!");
+        break;
     }
 
     free(pkt);
+    free(buffer);
+    free(pktRcv);
+
+    return STCP_SUCCESS;
 }
+
 
 
 /*
@@ -115,25 +164,21 @@ int stcp_send(stcp_send_ctrl_blk *cb, unsigned char* data, int length) {
 
     /* YOUR CODE HERE */
     int nSegments = (length / STCP_MSS) + 1;
-    int windowSize = cb->windowSize;
+    // int windowSize = cb->windowSize;
+    // int sentPackets = 0;
 
     for (int i = 0; i < nSegments; i++) {
       unsigned char *segment = data + (i * STCP_MSS);
       int len = min(STCP_MSS, length - (i * STCP_MSS));
       int seq = cb->seq;
 
-      printf("Sending segment %d with seq %d\n", i, seq);
+      logLog("send", "Sending segment %d with seq %d", i, seq);
       if (stcp_send_segment(cb, segment, len, seq) == STCP_ERROR) {
           return STCP_ERROR;
       }
 
       cb->seq = plus32(cb->seq, length);    
     }
-
-    // createSegment(pktSent, ACK, STCP_MAXWIN, cb->seq, cb->ack, NULL, 0);
-    // htonHdr(pktSent->hdr);
-    // pktSent->hdr->checksum = ipchecksum(pktSent->hdr, sizeof(tcpheader));
-    // write(fd, pktSent, sizeof(tcpheader));
 
     return STCP_SUCCESS;
 }
@@ -156,72 +201,95 @@ int stcp_send(stcp_send_ctrl_blk *cb, unsigned char* data, int length) {
 stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receiversPort) {
 
     logLog("init", "Sending from port %d to <%s, %d>", sendersPort, destination, receiversPort);
-    // Since I am the sender, the destination and receiversPort name the other side
     int fd = udp_open(destination, receiversPort, sendersPort);
     (void) fd;
+
     /* YOUR CODE HERE */
-    stcp_send_ctrl_blk *cb = malloc(sizeof(stcp_send_ctrl_blk));
+
+    // Check for failure to open connection
     if (fd < 0) {
         logPerror("Failed to open connection");
         return NULL;
     }
+
+    // Initialize control block
+    stcp_send_ctrl_blk *cb = calloc(1, sizeof(stcp_send_ctrl_blk));
+
     cb->fd = fd;
     cb->windowSize = STCP_MAXWIN;
 
     logLog("init", "Sending initial SYN pack to receiver");
 
-    // init sent packet
+    // Initializing the SYN packet
     packet *pktSent = calloc(1, sizeof(packet));
-    unsigned char *pktRcv = calloc(1, sizeof(tcpheader));
-    tcpheader *hdrRcv;
-
-    createSegment(pktSent, SYN, STCP_MAXWIN, 0, 0, NULL, 0);
-    pktSent->hdr->seqNo = 30;
+    createSegment(pktSent, SYN, STCP_MAXWIN, 30, 0, NULL, 0);
     htonHdr(pktSent->hdr);
     pktSent->hdr->checksum = ipchecksum(pktSent->hdr, sizeof(tcpheader));
 
+    // Setup buffer to receive incoming packet
+    unsigned char *buf = calloc(1, STCP_MTU);
+    packet *pktRcv = calloc(1, sizeof(packet));
+
     int res;
     int timeout = STCP_INITIAL_TIMEOUT;
-    int isSyncing = 1;
 
     // Try to send the initial SYN packet
-    while (isSyncing) {
+    while (1) {
       // Send the SYN packet
       write(fd, pktSent, sizeof(tcpheader));
+      dump('s', pktSent, sizeof(tcpheader));
+
       cb->state = STCP_SENDER_SYN_SENT;
 
-
       // Wait for the SYN-ACK packet
-      res = readWithTimeout(fd, pktRcv, timeout);
+      res = readWithTimeout(fd, buf, timeout);
       timeout = stcpNextTimeout(timeout);
 
-      // The receiver socket has closed
+      // Handle error cases
       if (res == STCP_READ_TIMED_OUT) {
         logLog("init", "Timed out waiting for SYN-ACK from receiver");
         continue;
-      } else
-      if (res == STCP_READ_PERMANENT_FAILURE) {
+      } else if (res == STCP_READ_PERMANENT_FAILURE) {
         logPerror("Failed to read SYN-ACK from receiver");
         return NULL;
       }
 
-      // The receiver has replied with a packet
-      hdrRcv = (tcpheader *)pktRcv;
-      ntohHdr(hdrRcv);
-      if (hdrRcv->flags == (SYN | ACK)) {
-        logLog("init", "Received SYN-ACK from receiver");
-        cb->state = STCP_SENDER_ESTABLISHED;
-        cb->ack = hdrRcv->seqNo + 1;
-        cb->seq = hdrRcv->ackNo;
-        cb->windowSize = hdrRcv->windowSize;
-        cb->windowStart = hdrRcv->ackNo;
-        isSyncing = 0;
-      } 
+      // Process the received packet
+      parsePacket(pktRcv, buf, res);
+      dump('r', pktRcv, pktRcv->len);
+
+      tcpheader *hdrRcv = pktRcv->hdr;
+
+      // Verify checksum
+      int checksum = validateChecksum(pktRcv);
+      if (!checksum) {
+        logLog("init", "Invalid checksum -> Received %x but expected %x", checksum, hdrRcv->checksum);
+        continue;
+      }
+
+      // Verify correct flags
+      if (hdrRcv->flags != (SYN | ACK)) {
+        logPerror("Received invalid flags in packet");
+        continue;
+      }
+
+      // Initialize the control block
+      logLog("init", "Received SYN-ACK from receiver");
+      cb->state = STCP_SENDER_ESTABLISHED;
+      cb->ack = hdrRcv->seqNo + 1;
+      cb->seq = hdrRcv->ackNo;
+      cb->windowSize = hdrRcv->windowSize;
+      cb->windowStart = hdrRcv->ackNo;
+      break;
     }
 
-    cb->state = STCP_SENDER_ESTABLISHED;
-    free(pktRcv);
+    // Free memory and return control block
+    free(buf);
     free(pktSent);
+    free(pktRcv);
+
+    cb->state = STCP_SENDER_ESTABLISHED;
+
     return cb;
 }
 
@@ -269,7 +337,7 @@ int main(int argc, char **argv) {
     unsigned char buffer[STCP_MSS];
     int num_read_bytes;
 
-    logConfig("sender", "init,segment,error,failure");
+    logConfig("sender", "failure,init,segment,send,sender");
     /* Verify that the arguments are right */
     if (argc > 5 || argc == 1) {
         fprintf(stderr, "usage: sender DestinationIPAddress/Name receiveDataOnPort sendDataToPort filename\n");

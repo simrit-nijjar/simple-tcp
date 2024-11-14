@@ -1,0 +1,6 @@
+{
+  "files.associations": {
+    ".viminfo": "shellscript",
+    "stdarg.h": "c"
+  }
+}

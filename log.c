@@ -79,7 +79,7 @@ void logLog(char *channel, char *format, ...) {
 
     if (enabled(channel)) {
 	long t = now() % 100000000;
-	printf("%4ld.%03ld %s: ", t / 1000, t % 1000, prefix);
+	printf("%4ld.%03ld %s: (%s) ", t / 1000, t % 1000, prefix, channel);
 	va_start(al, format);
 	vprintf(format, al);
 	va_end(al);
