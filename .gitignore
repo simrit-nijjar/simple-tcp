@@ -58,3 +58,4 @@ sender
 testtcp
 testwraparound
 waitForPorts
+largefile

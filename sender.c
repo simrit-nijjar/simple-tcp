@@ -49,9 +49,9 @@ typedef struct {
  * @return The calculated checksum, or -1 if the checksum is invalid
  */
 int validateChecksum(packet *pkt) {
-    unsigned short checksum = ipchecksum(pkt->data, pkt->len);
-    if (checksum != 0) return checksum;
-    return 1;
+  unsigned short checksum = ipchecksum(pkt->data, pkt->len);
+  if (checksum != 0) return checksum;
+  return 1;
 }
 
 /**
@@ -63,12 +63,19 @@ int validateChecksum(packet *pkt) {
  * @return The parsed packet in host byte order
  */
 void parsePacket(packet* pkt, unsigned char *data, int len) {
-    pkt->len = len;
-    if (data != NULL) {
-        memcpy(pkt->data, data, len);
-    }
-    pkt->hdr = (tcpheader *) pkt->data; 
-    ntohHdr(pkt->hdr);
+  pkt->len = len;
+  if (data != NULL) {
+      memcpy(pkt->data, data, len);
+  }
+  pkt->hdr = (tcpheader *) pkt->data; 
+  ntohHdr(pkt->hdr);
+}
+
+void initilizePacket(packet *pkt, int flags, unsigned short rwnd, unsigned int seq, unsigned int ack, unsigned char *data, int len) {
+  unsigned char *buffer = calloc(1, len + sizeof(tcpheader));
+  memcpy(buffer + sizeof(tcpheader), data, len);
+
+  createSegment(pkt, flags, rwnd, seq, ack, buffer, len);
 }
 
 int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, int seq) {
@@ -79,7 +86,7 @@ int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, i
     packet *pktRcv = calloc(1, sizeof(packet));
 
     // Prepare the segment and set all necessary fields
-    createSegment(pkt, ACK, STCP_MAXWIN, seq, cb->ack, data, length);
+    initilizePacket(pkt, ACK, STCP_MAXWIN, seq, cb->ack, data, length);
 
     // Display packet details for debugging
     dump('s', pkt, pkt->len);
@@ -158,32 +165,13 @@ int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, i
  * The function returns STCP_SUCCESS on success, or STCP_ERROR on error.
  */
 int stcp_send(stcp_send_ctrl_blk *cb, unsigned char* data, int length) {
+  logLog("send", "\n(seq %i) '%s'", cb->seq, data);
+  if (stcp_send_segment(cb, data, length, cb->seq) == STCP_ERROR) {
+      return STCP_ERROR;
+  }
 
-    /* YOUR CODE HERE */
-    int nSegments = (length / STCP_MSS) + 1;
-    // int windowSize = cb->windowSize;
-    // int sentPackets = 0;
-
-    for (int i = 0; i < nSegments; i++) {
-      unsigned char *segment = data + (i * STCP_MSS);
-      int len = min(STCP_MSS, length - (i * STCP_MSS));
-      int seq = cb->seq;
-
-      logLog("send", "Sending segment %d with seq %d", i, seq);
-      if (stcp_send_segment(cb, segment, len, seq) == STCP_ERROR) {
-          return STCP_ERROR;
-      }
-
-      cb->seq = plus32(cb->seq, len);    
-    }
-
-    cb->state = STCP_SENDER_CLOSING;
-
-    while (cb->state == STCP_SENDER_CLOSED) {
-        // Wait for the receiver to close the connection
-    }
-
-    return STCP_SUCCESS;
+  cb->seq = plus32(cb->seq, length);   
+  return STCP_SUCCESS;
 }
 
 /*
