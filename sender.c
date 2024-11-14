@@ -49,7 +49,6 @@ typedef struct {
  * @return The calculated checksum, or -1 if the checksum is invalid
  */
 int validateChecksum(packet *pkt) {
-    tcpheader *hdr = (tcpheader *) pkt->hdr;
     unsigned short checksum = ipchecksum(pkt->data, pkt->len);
     if (checksum != 0) return checksum;
     return 1;
@@ -82,14 +81,14 @@ int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, i
     // Prepare the segment and set all necessary fields
     createSegment(pkt, ACK, STCP_MAXWIN, seq, cb->ack, data, length);
 
-    // Calculate checksum on header + payload in host byte order
-    pkt->hdr->checksum = ipchecksum(pkt->data, pkt->len);
-
     // Display packet details for debugging
     dump('s', pkt, pkt->len);
 
     // Convert header fields to network byte order afterward
     htonHdr(pkt->hdr);
+
+    // Calculate checksum on header + payload in host byte order
+    pkt->hdr->checksum = ipchecksum(pkt->data, pkt->len);
 
     // Setup buffer to receive incoming packet
     unsigned char *buffer = calloc(1, sizeof(tcpheader));
@@ -113,8 +112,6 @@ int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, i
         parsePacket(pktRcv, buffer, lenRcv);
         tcpheader* hdrRcv = pktRcv->hdr;
 
-        dump('r', pktRcv, lenRcv);
-
         // Verify checksum
         int checkSum = validateChecksum(pktRcv);
         if (!checkSum) {
@@ -123,7 +120,7 @@ int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, i
         }
 
         // Additional ACK checks
-        if (getAck(hdrRcv) != ACK) {
+        if (hdrRcv->flags != ACK) {
             logLog("failure", "Invalid flags -> Received %x but expected %x", hdrRcv->flags, ACK);
             continue;
         }
@@ -177,7 +174,13 @@ int stcp_send(stcp_send_ctrl_blk *cb, unsigned char* data, int length) {
           return STCP_ERROR;
       }
 
-      cb->seq = plus32(cb->seq, length);    
+      cb->seq = plus32(cb->seq, len);    
+    }
+
+    cb->state = STCP_SENDER_CLOSING;
+
+    while (cb->state == STCP_SENDER_CLOSED) {
+        // Wait for the receiver to close the connection
     }
 
     return STCP_SUCCESS;
@@ -233,13 +236,14 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
     int res;
     int timeout = STCP_INITIAL_TIMEOUT;
 
+    cb->state = STCP_SENDER_SYN_SENT;
+
     // Try to send the initial SYN packet
-    while (1) {
+    while (cb->state == STCP_SENDER_SYN_SENT) {
       // Send the SYN packet
       write(fd, pktSent, sizeof(tcpheader));
       dump('s', pktSent, sizeof(tcpheader));
 
-      cb->state = STCP_SENDER_SYN_SENT;
 
       // Wait for the SYN-ACK packet
       res = readWithTimeout(fd, buf, timeout);
@@ -280,7 +284,8 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
       cb->seq = hdrRcv->ackNo;
       cb->windowSize = hdrRcv->windowSize;
       cb->windowStart = hdrRcv->ackNo;
-      break;
+      
+      cb->state = STCP_SENDER_ESTABLISHED;
     }
 
     // Free memory and return control block
@@ -288,7 +293,6 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
     free(pktSent);
     free(pktRcv);
 
-    cb->state = STCP_SENDER_ESTABLISHED;
 
     return cb;
 }
@@ -305,6 +309,66 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
  */
 int stcp_close(stcp_send_ctrl_blk *cb) {
     /* YOUR CODE HERE */
+
+    // Send FIN packet to receiver
+    packet *pkt = calloc(1, sizeof(packet));
+    createSegment(pkt, FIN, STCP_MAXWIN, cb->seq, cb->ack, NULL, 0);
+    htonHdr(pkt->hdr);
+    pkt->hdr->checksum = ipchecksum(pkt->data, pkt->len);
+
+    // Setup buffer to receive incoming packet
+    unsigned char *buffer = calloc(1, sizeof(tcpheader));
+    packet *pktRcv = calloc(1, sizeof(packet));
+
+    int timeout = STCP_INITIAL_TIMEOUT;
+
+    cb->state = STCP_SENDER_FIN_WAIT;
+
+    // Loop to send and wait for ACK
+    while (cb->state == STCP_SENDER_FIN_WAIT) {
+        logLog("finish", "Sending FIN packet to receiver");
+
+        // Send the packet and await response
+        write(cb->fd, pkt, pkt->len);
+        int lenRcv = readWithTimeout(cb->fd, buffer, timeout);
+        timeout = stcpNextTimeout(timeout);
+
+        if (lenRcv == STCP_READ_TIMED_OUT) {
+            logLog("send", "Timed out waiting for ACK from receiver");
+            continue;
+        }
+
+        // Process received packet
+        parsePacket(pktRcv, buffer, lenRcv);
+        tcpheader* hdrRcv = pktRcv->hdr;
+
+        // Verify checksum
+        int checkSum = validateChecksum(pktRcv);
+        if (!checkSum) {
+            logLog("failure", "Invalid Checksum -> %x is not 0", checkSum);
+            continue;
+        }
+
+        // Additional ACK checks
+        if (hdrRcv->flags != (ACK | FIN)) {
+            logLog("failure", "Invalid flags -> Received %x but expected %x", hdrRcv->flags, ACK);
+            continue;
+        }
+        if (hdrRcv->ackNo != cb->seq + 1) {
+            logLog("failure", "Invalid Ack -> Received %d but expected %d", hdrRcv->ackNo, cb->seq + 1);
+            continue;
+        }
+
+        logLog("send", "Received valid ACK from receiver!");
+        cb->state = STCP_SENDER_CLOSED;
+    }
+
+    free(pkt);
+    free(buffer);
+    free(pktRcv);
+
+    free(cb);
+
     return STCP_SUCCESS;
 }
 /*
