@@ -104,6 +104,14 @@ int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, i
     // Loop to send and wait for ACK
     while (1) {
         logLog("send", "Sending packet with seq %d", seq);
+        
+        int currentWindowIndex = minus32(seq, cb->windowStart);
+        printf("currentWindowIndex: %d\n", currentWindowIndex);
+
+        while (currentWindowIndex > cb->windowSize) {
+          // Wait for room in window to grow
+          printf("Waiting for room in window to grow\n");
+        }
 
         // Send the packet and await response
         write(fd, pkt, pkt->len);
@@ -131,10 +139,15 @@ int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, i
             logLog("failure", "Invalid flags -> Received %x but expected %x", hdrRcv->flags, ACK);
             continue;
         }
-        if (hdrRcv->ackNo != seq + length) {
+        printf("hdrRcv->ackNo: %d\n", hdrRcv->ackNo);
+        printf("cb->windowStart: %d\n", cb->windowStart);
+        if (!greater32(hdrRcv->ackNo, cb->windowStart)) {
             logLog("failure", "Invalid Ack -> Received %d but expected %d", hdrRcv->ackNo, seq + length);
             continue;
         }
+
+        cb->windowStart = hdrRcv->ackNo;
+        cb->windowSize = hdrRcv->windowSize;
 
         logLog("send", "Received valid ACK from receiver!");
         break;
@@ -260,10 +273,10 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
       }
 
       // Verify correct flags
-      if (hdrRcv->flags != (SYN | ACK)) {
-        logPerror("Received invalid flags in packet");
-        continue;
-      }
+        if (hdrRcv->flags != (ACK | SYN)) {
+          logLog("init", "Invalid flags -> Received %x but expected %x", hdrRcv->flags, ACK | SYN);
+          continue;
+        }
 
       // Initialize the control block
       logLog("init", "Received SYN-ACK from receiver");
@@ -324,6 +337,9 @@ int stcp_close(stcp_send_ctrl_blk *cb) {
         if (lenRcv == STCP_READ_TIMED_OUT) {
             logLog("send", "Timed out waiting for ACK from receiver");
             continue;
+        } else if (lenRcv == STCP_READ_PERMANENT_FAILURE) {
+            logPerror("Failed to read SYN-ACK from receiver");
+            return STCP_ERROR;
         }
 
         // Process received packet
