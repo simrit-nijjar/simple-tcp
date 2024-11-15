@@ -1,6 +1,7 @@
 {
   "files.associations": {
     ".viminfo": "shellscript",
-    "stdarg.h": "c"
+    "stdarg.h": "c",
+    "compare": "c"
   }
 }

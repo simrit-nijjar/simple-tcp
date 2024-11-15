@@ -96,87 +96,98 @@ void initilizePacket(packet *pkt, int flags, unsigned short rwnd, unsigned int s
 }
 
 void* stcp_send_segment(void* arg) {
-    // Cast the argument to the correct type (stcp_send_ctrl_blk and buffer info)
+    // Cast the argument to the correct type
     stcp_send_ctrl_blk* cb = ((thread_data*)arg)->cb;
     unsigned char* data = ((thread_data*)arg)->data;
-    int length = ((thread_data*)arg)->length;
+    unsigned int length = ((thread_data*)arg)->length;
     unsigned int seq = ((thread_data*)arg)->seq;
     unsigned int ack = ((thread_data*)arg)->ack;
 
-    int fd = cb->fd; 
+    int fd = cb->fd;
 
-    pthread_mutex_lock(cb->logicLock);  
     // Allocate and copy data
     packet *pkt = calloc(1, sizeof(packet));
     packet *pktRcv = calloc(1, sizeof(packet));
+    unsigned char *buffer = calloc(1, sizeof(tcpheader));
+    if (!pkt || !pktRcv || !buffer) {
+        logLog("failure", "Memory allocation failed");
+        free(pkt);
+        free(pktRcv);
+        free(buffer);
+        free(arg);
+        return NULL;
+    }
 
-    logLog("checkpoint", "Sending packet with seq %u", seq);
+    pthread_cleanup_push(free, pkt);
+    pthread_cleanup_push(free, pktRcv);
+    pthread_cleanup_push(free, buffer);
+    pthread_cleanup_push(free, arg);
 
-    // Prepare the segment and set all necessary fields
+    // Prepare the segment and set fields
+    pthread_mutex_lock(cb->logicLock);
     initilizePacket(pkt, ACK, STCP_MAXWIN, seq, ack, data, length);
+    pthread_mutex_unlock(cb->logicLock);
 
     // Display packet details for debugging
     dump('s', pkt, pkt->len);
 
-
-    pthread_mutex_unlock(cb->logicLock);
-
     // Convert header fields to network byte order afterward
     htonHdr(pkt->hdr);
-
-    // Calculate checksum on header + payload in host byte order
     pkt->hdr->checksum = ipchecksum(pkt->data, pkt->len);
 
-    // Setup buffer to receive incoming packet
-    unsigned char *buffer = calloc(1, sizeof(tcpheader));
     int timeout = STCP_INITIAL_TIMEOUT;
-
-
-    // Lock if previous packets have not been sent yet
-    while ((int) minus32(cb->windowPos, seq) < 0) {
-      logLog("excess", "(seq %u) Waiting for previous packets to finish sending", seq);
-    }
-
-    // Lock if window is full
-    unsigned int currWindowPos = minus32(seq, cb->windowStart);
-    while ((int) minus32(currWindowPos, cb->windowSize) > 0) {
-      logLog("excess", "(seq %u) Waiting for window to move", seq);
-    }
-
     int sent = 0;
 
-    // Loop to send and wait for ACK
-    while (1) {        
-        logLog("debug", "current window position: %u", cb->windowPos);
-        logLog("info", "Sending packet with seq %u", seq);
+    while (1) {
+        pthread_mutex_lock(cb->logicLock);
 
-        // If largest ack is more than the expected ack, then break
-        if ((int) minus32(cb->latestAck, seq + length) >= 0) {
-            logLog("success", "Received CUMUL ACK from receiver! Wanted Ack: %u :: Latest Ack: %u", seq + length, cb->latestAck);
-            break;
+        // Wait for previous packets to finish
+        while (greater32(seq, cb->windowPos)) {
+            pthread_mutex_unlock(cb->logicLock);
+            sched_yield(); // Allow other threads to execute
+            pthread_mutex_lock(cb->logicLock);
         }
 
+        // Wait for window to move
+        unsigned int currWindowPos = minus32(seq, cb->windowStart);
+        while (greater32(currWindowPos, cb->windowSize)) {
+            pthread_mutex_unlock(cb->logicLock);
+            sched_yield(); // Allow other threads to execute
+            pthread_mutex_lock(cb->logicLock);
+        }
 
-        // Send the packet and await response
+        pthread_mutex_unlock(cb->logicLock);
+
+        logLog("info", "Sending packet with seq %u", seq);
+
+        // If the desired ACK has already been received, exit
+        pthread_mutex_lock(cb->logicLock);
+        if (greater32(cb->latestAck, seq + length) || cb->latestAck == seq + length) {
+            logLog("success", "Received CUMUL ACK from receiver! Wanted Ack: %u :: Latest Ack: %u", seq + length, cb->latestAck);
+            pthread_mutex_unlock(cb->logicLock);
+            break;
+        }
+        pthread_mutex_unlock(cb->logicLock);
+
+        // Send the packet
         pthread_mutex_lock(cb->fileLock);
         write(fd, pkt, pkt->len);
+        pthread_mutex_unlock(cb->fileLock);
 
-        // Wait for ACK
-        int lenRcv = readWithTimeout(fd, buffer, timeout);
-
-        if (sent == 0) {
+        // Mark the packet as sent
+        if (!sent) {
+            pthread_mutex_lock(cb->logicLock);
             cb->windowPos = plus32(seq, length);
+            pthread_mutex_unlock(cb->logicLock);
             sent = 1;
         }
 
-        // Update timeout
-        timeout = stcpNextTimeout(timeout);
-        pthread_mutex_unlock(cb->fileLock);
-
-
+        // Wait for ACK
+        int lenRcv = readWithTimeout(fd, buffer, timeout);
+        timeout = stcpNextTimeout(timeout); // Update timeout value
 
         if (lenRcv == STCP_READ_TIMED_OUT) {
-            logLog("failure", "Timed out waiting for (?ACK %u) from receiver", seq + length);
+            logLog("failure", "Timed out waiting for ACK %u", seq + length);
             continue;
         }
 
@@ -186,45 +197,41 @@ void* stcp_send_segment(void* arg) {
 
         pthread_mutex_lock(cb->logicLock);
         dump('r', pktRcv, pktRcv->len);
-        pthread_mutex_unlock(cb->logicLock);
 
         // Verify checksum
-        int checkSum = validateChecksum(pktRcv);
-        if (!checkSum) {
-            logLog("failure", "Invalid Checksum -> Received %u but expected %u", checkSum, hdrRcv->checksum);
+        if (!validateChecksum(pktRcv)) {
+            logLog("failure", "Invalid checksum");
+            pthread_mutex_unlock(cb->logicLock);
             continue;
         }
 
-        // Additional ACK checks
-        if (hdrRcv->flags != ACK) {
-            logLog("failure", "Invalid flags -> Received %u but expected %u", hdrRcv->flags, ACK);
+        // Verify ACK
+        if (hdrRcv->flags != ACK || hdrRcv->ackNo <= seq) {
+            logLog("failure", "Invalid ACK: Received %u, Expected %u", hdrRcv->ackNo, seq + length);
+            pthread_mutex_unlock(cb->logicLock);
             continue;
         }
-        
-        pthread_mutex_lock(cb->logicLock);
-        if (hdrRcv->ackNo <= seq) {
-            logLog("failure", "Invalid Ack -> Received %u but expected %u", hdrRcv->ackNo, seq + length);
-            continue;
-        }
+
+        // Update control block with latest ACK info
         cb->windowStart = hdrRcv->ackNo;
-        if (minus32(hdrRcv->ackNo, cb->latestAck) > 0) {
-          cb->latestAck = hdrRcv->ackNo;
-          cb->windowSize = hdrRcv->windowSize;  
+        if (greater32(hdrRcv->ackNo, cb->latestAck)) {
+            cb->latestAck = hdrRcv->ackNo;
+            cb->windowSize = hdrRcv->windowSize;
         }
+
         pthread_mutex_unlock(cb->logicLock);
-
-
-        logLog("success", "Received valid ACK from receiver! Seq: %u :: Ack: %u", hdrRcv->seqNo, hdrRcv->ackNo);
+        logLog("success", "Valid ACK received! Seq: %u :: Ack: %u", hdrRcv->seqNo, hdrRcv->ackNo);
         break;
     }
 
-    free(pkt);
-    free(buffer);
-    free(pktRcv);
-    free(arg);
+    pthread_cleanup_pop(1); // Free pkt
+    pthread_cleanup_pop(1); // Free pktRcv
+    pthread_cleanup_pop(1); // Free buffer
+    pthread_cleanup_pop(1); // Free arg
 
     return NULL;
 }
+
 
 
 
@@ -247,7 +254,7 @@ int stcp_send(stcp_send_ctrl_blk *cb, unsigned char* data, int length) {
   logLog("body", "(seq %i) '%s'", cb->seq, data);
   // Allocate memory for the thread argument struct
 
-  unsigned int seq = cb->seq + 2;
+  unsigned int seq = cb->seq + 1;
   unsigned int initSeq = cb->initSeq;
   unsigned int index = ceil((minus32(seq, initSeq)) / STCP_MSS);
 
