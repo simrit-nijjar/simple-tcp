@@ -1,5 +1,5 @@
 #!/bin/bash
-file=smallfile
+file=numbers
 rm -f OutputFile
 pkill sender
 pkill receiver

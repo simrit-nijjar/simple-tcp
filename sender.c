@@ -23,6 +23,10 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/file.h>
+#include <sys/stat.h>
+
+#include <math.h>
+#include <pthread.h>
 
 #include "stcp.h"
 
@@ -32,13 +36,26 @@
 typedef struct {
     int fd;
     int state;
+    unsigned int initSeq;
     unsigned int seq;
     unsigned int ack;
+    unsigned int latestAck;
     unsigned int windowStart;
+    unsigned int windowPos;
     unsigned int windowSize;
-    unsigned char window[STCP_MAXWIN];
+    pthread_t *threads;
+    pthread_mutex_t* fileLock;
+    pthread_mutex_t* logicLock;
 } stcp_send_ctrl_blk;
 /* ADD ANY EXTRA FUNCTIONS HERE */
+
+typedef struct {
+    stcp_send_ctrl_blk* cb;
+    unsigned char* data;
+    unsigned int length;
+    unsigned int seq;
+    unsigned int ack;
+} thread_data;
 
 
 /**
@@ -78,18 +95,31 @@ void initilizePacket(packet *pkt, int flags, unsigned short rwnd, unsigned int s
   createSegment(pkt, flags, rwnd, seq, ack, buffer, len);
 }
 
-int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, int seq) {
-    int fd = cb->fd;
+void* stcp_send_segment(void* arg) {
+    // Cast the argument to the correct type (stcp_send_ctrl_blk and buffer info)
+    stcp_send_ctrl_blk* cb = ((thread_data*)arg)->cb;
+    unsigned char* data = ((thread_data*)arg)->data;
+    int length = ((thread_data*)arg)->length;
+    unsigned int seq = ((thread_data*)arg)->seq;
+    unsigned int ack = ((thread_data*)arg)->ack;
 
+    int fd = cb->fd; 
+
+    pthread_mutex_lock(cb->logicLock);  
     // Allocate and copy data
     packet *pkt = calloc(1, sizeof(packet));
     packet *pktRcv = calloc(1, sizeof(packet));
 
+    logLog("checkpoint", "Sending packet with seq %u", seq);
+
     // Prepare the segment and set all necessary fields
-    initilizePacket(pkt, ACK, STCP_MAXWIN, seq, cb->ack, data, length);
+    initilizePacket(pkt, ACK, STCP_MAXWIN, seq, ack, data, length);
 
     // Display packet details for debugging
     dump('s', pkt, pkt->len);
+
+
+    pthread_mutex_unlock(cb->logicLock);
 
     // Convert header fields to network byte order afterward
     htonHdr(pkt->hdr);
@@ -101,25 +131,52 @@ int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, i
     unsigned char *buffer = calloc(1, sizeof(tcpheader));
     int timeout = STCP_INITIAL_TIMEOUT;
 
-    // Loop to send and wait for ACK
-    while (1) {
-        logLog("send", "Sending packet with seq %d", seq);
-        
-        int currentWindowIndex = minus32(seq, cb->windowStart);
-        printf("currentWindowIndex: %d\n", currentWindowIndex);
 
-        while (currentWindowIndex > cb->windowSize) {
-          // Wait for room in window to grow
-          printf("Waiting for room in window to grow\n");
+    // Lock if previous packets have not been sent yet
+    while ((int) minus32(cb->windowPos, seq) < 0) {
+      logLog("excess", "(seq %u) Waiting for previous packets to finish sending", seq);
+    }
+
+    // Lock if window is full
+    unsigned int currWindowPos = minus32(seq, cb->windowStart);
+    while ((int) minus32(currWindowPos, cb->windowSize) > 0) {
+      logLog("excess", "(seq %u) Waiting for window to move", seq);
+    }
+
+    int sent = 0;
+
+    // Loop to send and wait for ACK
+    while (1) {        
+        logLog("debug", "current window position: %u", cb->windowPos);
+        logLog("info", "Sending packet with seq %u", seq);
+
+        // If largest ack is more than the expected ack, then break
+        if ((int) minus32(cb->latestAck, seq + length) >= 0) {
+            logLog("success", "Received CUMUL ACK from receiver! Wanted Ack: %u :: Latest Ack: %u", seq + length, cb->latestAck);
+            break;
         }
 
+
         // Send the packet and await response
+        pthread_mutex_lock(cb->fileLock);
         write(fd, pkt, pkt->len);
+
+        // Wait for ACK
         int lenRcv = readWithTimeout(fd, buffer, timeout);
+
+        if (sent == 0) {
+            cb->windowPos = plus32(seq, length);
+            sent = 1;
+        }
+
+        // Update timeout
         timeout = stcpNextTimeout(timeout);
+        pthread_mutex_unlock(cb->fileLock);
+
+
 
         if (lenRcv == STCP_READ_TIMED_OUT) {
-            logLog("send", "Timed out waiting for ACK from receiver");
+            logLog("failure", "Timed out waiting for (?ACK %u) from receiver", seq + length);
             continue;
         }
 
@@ -127,37 +184,46 @@ int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, i
         parsePacket(pktRcv, buffer, lenRcv);
         tcpheader* hdrRcv = pktRcv->hdr;
 
+        pthread_mutex_lock(cb->logicLock);
+        dump('r', pktRcv, pktRcv->len);
+        pthread_mutex_unlock(cb->logicLock);
+
         // Verify checksum
         int checkSum = validateChecksum(pktRcv);
         if (!checkSum) {
-            logLog("failure", "Invalid Checksum -> Received %x but expected %x", checkSum, hdrRcv->checksum);
+            logLog("failure", "Invalid Checksum -> Received %u but expected %u", checkSum, hdrRcv->checksum);
             continue;
         }
 
         // Additional ACK checks
         if (hdrRcv->flags != ACK) {
-            logLog("failure", "Invalid flags -> Received %x but expected %x", hdrRcv->flags, ACK);
+            logLog("failure", "Invalid flags -> Received %u but expected %u", hdrRcv->flags, ACK);
             continue;
         }
-        printf("hdrRcv->ackNo: %d\n", hdrRcv->ackNo);
-        printf("cb->windowStart: %d\n", cb->windowStart);
-        if (!greater32(hdrRcv->ackNo, cb->windowStart)) {
-            logLog("failure", "Invalid Ack -> Received %d but expected %d", hdrRcv->ackNo, seq + length);
+        
+        pthread_mutex_lock(cb->logicLock);
+        if (hdrRcv->ackNo <= seq) {
+            logLog("failure", "Invalid Ack -> Received %u but expected %u", hdrRcv->ackNo, seq + length);
             continue;
         }
-
         cb->windowStart = hdrRcv->ackNo;
-        cb->windowSize = hdrRcv->windowSize;
+        if (minus32(hdrRcv->ackNo, cb->latestAck) > 0) {
+          cb->latestAck = hdrRcv->ackNo;
+          cb->windowSize = hdrRcv->windowSize;  
+        }
+        pthread_mutex_unlock(cb->logicLock);
 
-        logLog("send", "Received valid ACK from receiver!");
+
+        logLog("success", "Received valid ACK from receiver! Seq: %u :: Ack: %u", hdrRcv->seqNo, hdrRcv->ackNo);
         break;
     }
 
     free(pkt);
     free(buffer);
     free(pktRcv);
+    free(arg);
 
-    return STCP_SUCCESS;
+    return NULL;
 }
 
 
@@ -178,12 +244,29 @@ int stcp_send_segment(stcp_send_ctrl_blk *cb, unsigned char* data, int length, i
  * The function returns STCP_SUCCESS on success, or STCP_ERROR on error.
  */
 int stcp_send(stcp_send_ctrl_blk *cb, unsigned char* data, int length) {
-  logLog("send", "\n(seq %i) '%s'", cb->seq, data);
-  if (stcp_send_segment(cb, data, length, cb->seq) == STCP_ERROR) {
-      return STCP_ERROR;
-  }
+  logLog("body", "(seq %i) '%s'", cb->seq, data);
+  // Allocate memory for the thread argument struct
 
-  cb->seq = plus32(cb->seq, length);   
+  unsigned int seq = cb->seq + 2;
+  unsigned int initSeq = cb->initSeq;
+  unsigned int index = ceil((minus32(seq, initSeq)) / STCP_MSS);
+
+  thread_data* send_arg = malloc(sizeof(thread_data));
+  send_arg->cb = cb;
+  send_arg->data = data;
+  send_arg->length = length;
+  send_arg->seq = cb->seq;
+  send_arg->ack = cb->ack;
+
+  cb->seq = plus32(cb->seq, length);
+  // cb->ack = plus32(cb->ack, 1);
+
+  // Create a new thread for sending the data
+
+  logLog("thread", "Creating thread %d", index);
+  if (pthread_create(&(cb->threads[index]), NULL, stcp_send_segment, send_arg) != 0) {
+      logPerror("Error creating thread for sending data.");
+  }
   return STCP_SUCCESS;
 }
 
@@ -227,6 +310,10 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
     // Initializing the SYN packet
     packet *pktSent = calloc(1, sizeof(packet));
     createSegment(pktSent, SYN, STCP_MAXWIN, 30, 0, NULL, 0);
+    
+    dump('s', pktSent, sizeof(tcpheader));
+
+
     htonHdr(pktSent->hdr);
     pktSent->hdr->checksum = ipchecksum(pktSent->hdr, sizeof(tcpheader));
 
@@ -243,7 +330,7 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
     while (cb->state == STCP_SENDER_SYN_SENT) {
       // Send the SYN packet
       write(fd, pktSent, sizeof(tcpheader));
-      dump('s', pktSent, sizeof(tcpheader));
+
 
 
       // Wait for the SYN-ACK packet
@@ -252,7 +339,7 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
 
       // Handle error cases
       if (res == STCP_READ_TIMED_OUT) {
-        logLog("init", "Timed out waiting for SYN-ACK from receiver");
+        logPerror("Timed out waiting for SYN-ACK from receiver");
         continue;
       } else if (res == STCP_READ_PERMANENT_FAILURE) {
         logPerror("Failed to read SYN-ACK from receiver");
@@ -261,6 +348,7 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
 
       // Process the received packet
       parsePacket(pktRcv, buf, res);
+      logLog("init", "Receiving SYN-ACK from receiver");
       dump('r', pktRcv, pktRcv->len);
 
       tcpheader *hdrRcv = pktRcv->hdr;
@@ -279,12 +367,15 @@ stcp_send_ctrl_blk * stcp_open(char *destination, int sendersPort, int receivers
         }
 
       // Initialize the control block
-      logLog("init", "Received SYN-ACK from receiver");
+      logLog("success", "Received SYN-ACK from receiver. Syn: %u :: Ack: %u", hdrRcv->seqNo, hdrRcv->ackNo);
       cb->state = STCP_SENDER_ESTABLISHED;
-      cb->ack = hdrRcv->seqNo + 1;
+      cb->ack = (unsigned int) hdrRcv->seqNo + 1;
       cb->seq = hdrRcv->ackNo;
+      cb->initSeq = hdrRcv->ackNo;
+      cb->latestAck = hdrRcv->ackNo;
       cb->windowSize = hdrRcv->windowSize;
       cb->windowStart = hdrRcv->ackNo;
+      cb->windowPos = hdrRcv->ackNo;
       
       cb->state = STCP_SENDER_ESTABLISHED;
     }
@@ -335,7 +426,7 @@ int stcp_close(stcp_send_ctrl_blk *cb) {
         timeout = stcpNextTimeout(timeout);
 
         if (lenRcv == STCP_READ_TIMED_OUT) {
-            logLog("send", "Timed out waiting for ACK from receiver");
+            logLog("finish", "Timed out waiting for ACK from receiver");
             continue;
         } else if (lenRcv == STCP_READ_PERMANENT_FAILURE) {
             logPerror("Failed to read SYN-ACK from receiver");
@@ -363,7 +454,7 @@ int stcp_close(stcp_send_ctrl_blk *cb) {
             continue;
         }
 
-        logLog("send", "Received valid ACK from receiver!");
+        logLog("success", "Received valid ACK from receiver!");
         cb->state = STCP_SENDER_CLOSED;
     }
 
@@ -371,6 +462,9 @@ int stcp_close(stcp_send_ctrl_blk *cb) {
     free(buffer);
     free(pktRcv);
 
+    pthread_mutex_destroy(cb->fileLock);
+    pthread_mutex_destroy(cb->logicLock);
+    
     free(cb);
 
     return STCP_SUCCESS;
@@ -405,7 +499,13 @@ int main(int argc, char **argv) {
     unsigned char buffer[STCP_MSS];
     int num_read_bytes;
 
-    logConfig("sender", "failure,init,segment,send,sender");
+    logConfig("sender", "failure,success,finish,init,sender,thread,checkpoint,debug");
+    // logConfig("sender", "failure,success,finish,init,sender,thread,checkpoint");
+    // logConfig("sender", "failure,success,finish,init,sender,thread");
+    // logConfig("sender", "failure,success,finish,init,sender");
+    // logConfig("sender", "failure,success,finish,init");
+    // logConfig("sender", "failure,success,finish");
+    // logConfig("sender", "");
     /* Verify that the arguments are right */
     if (argc > 5 || argc == 1) {
         fprintf(stderr, "usage: sender DestinationIPAddress/Name receiveDataOnPort sendDataToPort filename\n");
@@ -438,12 +538,30 @@ int main(int argc, char **argv) {
     if (cb == NULL) {
         /* YOUR CODE HERE */
         logPerror("Failed to open connection");
+        exit(1);
     }
+
+    pthread_mutex_t file_mutex;
+    pthread_mutex_t logic_mutex;
+    pthread_mutex_init(&file_mutex, NULL);
+    pthread_mutex_init(&logic_mutex, NULL);
+    cb->fileLock = &file_mutex;
+    cb->logicLock = &logic_mutex;
 
     /* Start to send data in file via STCP to remote receiver. Chop up
      * the file into pieces as large as max packet size and transmit
      * those pieces.
      */
+    struct stat st;
+
+    fstat(file, &st);
+    const unsigned int numPackets = ceil(st.st_size / STCP_MSS) + 1;
+
+    logLog("debug", "number of total packets: %d", numPackets);
+
+    pthread_t threads[numPackets];
+    cb->threads = threads;
+
     while (1) {
         num_read_bytes = read(file, buffer, sizeof(buffer));
 
@@ -453,12 +571,29 @@ int main(int argc, char **argv) {
 
         if (stcp_send(cb, buffer, num_read_bytes) == STCP_ERROR) {
             /* YOUR CODE HERE */
+            logPerror("!!!!!!!!!!!!!!!!!!!!! Failed to send data");
         }
     }
+
+    cb->state = STCP_SENDER_CLOSING;
+
+    for (int i = 0; i < numPackets; i++) {
+        int result = pthread_join(threads[i], NULL);
+        if (result != 0) {
+            logLog("failure", "Failed to join thread with error code %d", result);
+            exit(1);
+        } else {
+          logLog("success", "Thread %d has finished", i);
+        }
+    }
+
+    logLog("success", "!! All threads have finished !!");
 
     /* Close the connection to remote receiver */
     if (stcp_close(cb) == STCP_ERROR) {
         /* YOUR CODE HERE */
+        logPerror("Failed to close connection");
+        exit(1);
     }
 
     return 0;

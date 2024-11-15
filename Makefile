@@ -11,7 +11,7 @@ CC     = gcc
 CFLAGS = -g -Wall
 
 all:	testwraparound testtcp sender waitForPorts 
-	bash ./runallerrorsbig.sh
+	bash ./runnoerrors.sh
 
 sender: sender.o stcp.o wraparound.o tcp.o log.o
 	$(CC) -o $@ $(CFLAGS) $^
